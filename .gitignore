@@ -1,0 +1,13 @@
+# 本地凭据与配置，严禁提交
+credentials.json
+email.json
+task.xml
+
+# 日志
+logs/
+*.log
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
