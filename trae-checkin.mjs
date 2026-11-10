@@ -20,7 +20,7 @@ import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, userInfo } from 'node:os';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 
 // ---------- 常量（与官方插件 channel-pack 保持一致） ----------
 const UG_HOST = 'https://api.trae.cn';
@@ -43,8 +43,24 @@ const EMAIL_CFG_PATH = join(STORE_DIR, 'email.json');
 const LOG_DIR = join(STORE_DIR, 'logs');
 
 // ---------- 工具 ----------
+const LOG_RETENTION_DAYS = 30;
+
 function ensureDir(p) { if (!existsSync(p)) mkdirSync(p, { recursive: true }); }
 ensureDir(STORE_DIR); ensureDir(LOG_DIR);
+
+// 清理超过保留期的日志
+function pruneLogs() {
+  const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  try {
+    for (const name of readdirSync(LOG_DIR)) {
+      const m = /^(\d{4}-\d{2}-\d{2})\.log$/.exec(name);
+      if (!m) continue;
+      if (new Date(`${m[1]}T00:00:00Z`).getTime() < cutoff) {
+        try { unlinkSync(join(LOG_DIR, name)); } catch { /* 忽略单个文件失败 */ }
+      }
+    }
+  } catch { /* 目录不可读时跳过 */ }
+}
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -486,18 +502,27 @@ const TASK_NAME = 'TraeCheckin';
 function psPath() { return join(STORE_DIR, 'TraeCheckin.ps1'); }
 
 function writePs1() {
-  const node = execSync('where.exe node').toString().split('\n')[0].trim();
-  const script = `
-$Node = '${node.replace(/'/g, "''")}'
-$Script = '${join(STORE_DIR, 'trae-checkin.mjs').replace(/'/g, "''")}'
-& $Node $Script run >> "${join(LOG_DIR, 'task.log').replace(/\\/g, '\\')}" 2>&1
-`;
-  writeFileSync(psPath(), script, 'utf8');
-  // 同时把 mjs 复制到 STORE_DIR，避免源目录被移动
-  const src = new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
-  const dst = join(STORE_DIR, 'trae-checkin.mjs');
-  if (src !== dst) writeFileSync(dst, readFileSync(src));
-  return { node, ps1: psPath() };
+  const srcDir = fileURLToPath(new URL('.', import.meta.url));
+  const srcMjs = join(srcDir, 'trae-checkin.mjs');
+  const srcPs1 = join(srcDir, 'TraeCheckin.ps1');
+  const dstMjs = join(STORE_DIR, 'trae-checkin.mjs');
+
+  // 把脚本复制到安装目录，避免源目录被移动或删除后计划任务失效
+  if (srcMjs !== dstMjs) writeFileSync(dstMjs, readFileSync(srcMjs));
+
+  // 优先使用仓库里的 TraeCheckin.ps1，保持单一来源；缺失时生成最小等价脚本
+  if (existsSync(srcPs1)) {
+    writeFileSync(psPath(), readFileSync(srcPs1));
+  } else {
+    const node = execSync('where.exe node').toString().split('\n')[0].trim();
+    writeFileSync(psPath(), [
+      `$Node = '${node.replace(/'/g, "''")}'`,
+      `$Script = '${dstMjs.replace(/'/g, "''")}'`,
+      `& $Node $Script run *>> '${join(LOG_DIR, 'task.log').replace(/'/g, "''")}'`,
+      '',
+    ].join('\r\n'), 'utf8');
+  }
+  return { ps1: psPath() };
 }
 
 function cmdInstall() {
@@ -605,6 +630,13 @@ async function runOnce(cred) {
 
 // ---------- 入口 ----------
 const arg = process.argv[2];
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+if (NODE_MAJOR < 18) {
+  console.error(`需要 Node.js 18 或更高版本，当前为 ${process.versions.node}`);
+  process.exit(1);
+}
+pruneLogs();
+
 (async () => {
   switch (arg) {
     case 'login': await cmdLogin(); break;
