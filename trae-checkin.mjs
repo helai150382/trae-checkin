@@ -28,6 +28,7 @@ const OAUTH_HOST = 'https://api.trae.com.cn';
 const CONSOLE_HOST = 'https://www.trae.cn';
 const CHECKIN_STATUS_PATH = '/trae/api/v2/ug/checkin_credits/status';
 const CHECKIN_CLAIM_PATH = '/trae/api/v2/ug/checkin_credits/claim';
+const ENT_USAGE_PATH = '/trae/api/v2/pay/ide_user_ent_usage';
 const EXCHANGE_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken';
 const CLIENT_ID = 'en1oxy7wnw8j9n';
 const APP_ID = '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8';
@@ -214,12 +215,12 @@ async function sendResultEmail(result, status) {
   if (!cfg) return false;
   const date = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
   const statusLine = status
-    ? `签到状态：${status.checkedIn ? '已签' : '未签'} | 连续签到：${status.streakDays} 天 | 总积分：${status.totalCredits}`
+    ? `签到状态：${status.checkedIn ? '已签' : '未签'} | 连续签到：${status.streakDays ?? '—'} 天 | 总积分：${status.totalCredits ?? '—'}`
     : '（状态查询不可用）';
   const body =
     `Trae 每日签到结果\n` +
     `时间：${date}\n` +
-    `账号：${status?.nickname || '—'}\n` +
+    `账号：${status?.nickname || loadCred()?.nickname || '—'}\n` +
     `结果：${result.message}\n` +
     `${statusLine}\n` +
     `\n——由 trae-checkin 自动发送`;
@@ -317,14 +318,52 @@ async function fetchStatus(cred, uid) {
     enable: data.enable === true,
     checkedIn: checkedRaw === true,
     credits: Number(data.credits) || 0,
-    totalCredits: Number(data.total_credits) || 0,
-    streakDays: Number(data.streak_days) || 0,
+    totalCredits: data.total_credits !== undefined ? Number(data.total_credits) : null,
+    streakDays: data.streak_days !== undefined ? Number(data.streak_days) : null,
   };
 }
 
 // 供调试使用
 if (process.env.TRAECHECKIN_DEBUG === '1') {
   globalThis.__fetchStatus = fetchStatus;
+}
+
+// status 接口不含总积分/连续签到天数，需查权益接口：
+// 总积分 = usage_summary.total_amount - consumed_amount（剩余额度）
+// 连续签到 = 「每日签到」积分包的发放日期从今天往回数的连续天数
+function dateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function fetchCredits(cred, uid, checkedInToday) {
+  const r = await postJson(`${UG_HOST}${ENT_USAGE_PATH}`, checkinHeaders(cred, uid), { require_usage: true, req_source: 2 });
+  if (!r.ok || !r.json) return null;
+  const j = r.json;
+  const total = Number(j.usage_summary?.total_amount);
+  const consumed = Number(j.usage_summary?.consumed_amount);
+  const daySet = new Set();
+  for (const p of j.user_entitlement_pack_list || []) {
+    if (p.group_name !== '每日签到') continue;
+    const ts = Number(p.entitlement_base_info?.start_time);
+    if (ts > 0) daySet.add(dateKey(new Date(ts * 1000)));
+  }
+  // 今天刚签的包可能延迟入账，已签则手动补上今天
+  if (checkedInToday) daySet.add(dateKey(new Date()));
+  const cursor = new Date();
+  if (!daySet.has(dateKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+  let streak = 0;
+  while (daySet.has(dateKey(cursor))) { streak++; cursor.setDate(cursor.getDate() - 1); }
+  return {
+    totalCredits: Number.isFinite(total) && Number.isFinite(consumed) ? Math.round(total - consumed) : null,
+    streakDays: streak,
+  };
+}
+
+async function enrichStatus(cred, status) {
+  if (!status || status.code !== 0) return status;
+  const c = await fetchCredits(cred, cred.uid, status.checkedIn);
+  if (c) { status.totalCredits = c.totalCredits; status.streakDays = c.streakDays; }
+  return status;
 }
 
 async function claimOnce(cred, uid) {
@@ -448,7 +487,7 @@ async function cmdRun() {
   const uid = cred.uid;
   if (!uid) return { code: 3, message: '凭据缺少 uid，请重新 login', status: null };
 
-  const status = await fetchStatus(cred, uid);
+  const status = await enrichStatus(cred, await fetchStatus(cred, uid));
   const baseStatus = status;
   if (status === null) return { code: 4, message: '查询签到状态失败（网络/格式异常）', status: null };
   if (status.code !== 0) {
@@ -467,7 +506,7 @@ async function cmdRun() {
     if (code === 9074) return { code: 5, message: '领取被拒 9074（当前参与用户太多/设备限制），今天不再重试', status };
     if (code === 9095) return { code: 0, message: '本设备今日已签到', status };
     if (code === 0) {
-      const after = await fetchStatus(cred, uid);
+      const after = await enrichStatus(cred, await fetchStatus(cred, uid));
       if (after?.checkedIn) return { code: 0, message: `签到成功，本次获得 ${status.credits || '?'} 积分`, status: after };
       return { code: 5, message: 'claim 返回 code=0 但回读仍未签到，记为 ineligible', status };
     }
@@ -482,11 +521,11 @@ async function cmdStatus() {
   console.log(`账号: ${cred.nickname || cred.uid}`);
   console.log(`uid: ${cred.uid}`);
   console.log(`token 过期时间: ${cred.expires_at ? new Date(Number(cred.expires_at)).toLocaleString() : '未知'}`);
-  const s = await fetchStatus(cred, cred.uid);
+  const s = await enrichStatus(cred, await fetchStatus(cred, cred.uid));
   if (s && s.code === 0) {
     console.log(`今日签到: ${s.checkedIn ? '已签' : '未签'}`);
-    console.log(`连续签到: ${s.streakDays} 天`);
-    console.log(`总积分: ${s.totalCredits}`);
+    console.log(`连续签到: ${s.streakDays ?? '—'} 天`);
+    console.log(`总积分: ${s.totalCredits ?? '—'}`);
   } else {
     console.log('状态查询失败: ' + JSON.stringify(s));
   }
@@ -654,7 +693,7 @@ pruneLogs();
       // 立即查询状态并发送测试邮件，不执行签到
       const cred = loadCred();
       let status = null;
-      if (cred?.uid) status = await fetchStatus(cred, cred.uid);
+      if (cred?.uid) status = await enrichStatus(cred, await fetchStatus(cred, cred.uid));
       const message = status?.checkedIn ? '今日已签到' : (status ? '今日未签到' : '状态查询失败');
       const result = { code: status ? 0 : 4, message, status };
       const ok = await sendResultEmail(result, status);
